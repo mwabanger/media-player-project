@@ -9,6 +9,7 @@ from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QIcon
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
+#mwamburi
 # genres to choose from
 GENRES = ["Pop", "Hip Hop", "Afrobeat", "Amapiano", "Reggae", "Jazz", "Gospel", "RnB"]
 
