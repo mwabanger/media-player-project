@@ -1,0 +1,482 @@
+import sys, os, json
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QFileDialog, QSlider, QInputDialog, QTreeWidget,
+    QTreeWidgetItem, QLineEdit, QSizePolicy, QMessageBox
+)
+from PyQt6.QtCore import Qt, QUrl, QTimer, QSize
+from PyQt6.QtGui import QIcon, QFontMetrics, QPixmap, QKeySequence, QShortcut, QColor
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+
+GENRES = ["Pop", "Hip Hop", "Afrobeat", "Amapiano", "Reggae", "Jazz", "Gospel", "RnB"]
+music_library = {g: {} for g in GENRES}
+current = {"genre": None, "artist": None, "song": None, "idx": None}
+is_playing = False
+LIBRARY_FILE = "library.json"
+
+def update_tree(tree):
+    tree.clear()
+    for genre, artists in music_library.items():
+        for artist, songs in artists.items():
+            for song in songs:
+                item = QTreeWidgetItem([song["title"], artist, genre])
+                item.setData(0, Qt.ItemDataRole.UserRole, (genre, artist, song["path"], song.get("album_art", "")))
+                tree.addTopLevelItem(item)
+
+def update_now_playing(now_playing):
+    text = f"Playing: {current['song']} by {current['artist']} ({current['genre']})" if current["song"] else "No song selected"
+    metrics = QFontMetrics(now_playing.font())
+    now_playing.setText(metrics.elidedText(text, Qt.TextElideMode.ElideRight, now_playing.width() or 500))
+
+def play_song(media_player, play_btn, now_playing, genre, artist, idx, album_art_label):
+    global is_playing
+    song = music_library[genre][artist][idx]
+    current.update({"genre": genre, "artist": artist, "song": song["title"], "idx": idx})
+    media_player.setSource(QUrl.fromLocalFile(song["path"]))
+    media_player.play()
+    is_playing = True
+    play_btn.setIcon(QIcon.fromTheme("media-playback-pause"))
+    update_now_playing(now_playing)
+    art = song.get("album_art", "")
+    if album_art_label is not None:
+        pix = QPixmap(art) if art and os.path.exists(art) else QIcon.fromTheme("media-optical").pixmap(180, 180)
+        album_art_label.setPixmap(pix.scaled(200, 200, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+
+def toggle_play(media_player, play_btn, now_playing, album_art_label):
+    global is_playing
+    if not current["song"]:
+        for g in GENRES:
+            for a in music_library[g]:
+                if music_library[g][a]:
+                    play_song(media_player, play_btn, now_playing, g, a, 0, album_art_label)
+                    return
+        return
+    if is_playing:
+        media_player.pause()
+        is_playing = False
+        play_btn.setIcon(QIcon.fromTheme("media-playback-start"))
+    else:
+        media_player.play()
+        is_playing = True
+        play_btn.setIcon(QIcon.fromTheme("media-playback-pause"))
+
+def get_flat_song_list():
+    return [(g, a, i, s) for g, artists in music_library.items() for a, songs in artists.items() for i, s in enumerate(songs)]
+
+def find_current_flat_index():
+    for i, (g, a, idx, s) in enumerate(get_flat_song_list()):
+        if (g == current["genre"] and a == current["artist"] and s["title"] == current["song"]):
+            return i
+    return -1
+
+def prev_song(media_player, play_btn, now_playing, album_art_label):
+    flat, idx = get_flat_song_list(), find_current_flat_index()
+    if idx > 0:
+        g, a, song_idx, _ = flat[idx - 1]
+        play_song(media_player, play_btn, now_playing, g, a, song_idx, album_art_label)
+        update_now_playing(now_playing)
+
+def next_song(media_player, play_btn, now_playing, album_art_label):
+    flat, idx = get_flat_song_list(), find_current_flat_index()
+    if 0 <= idx < len(flat) - 1:
+        g, a, song_idx, _ = flat[idx + 1]
+        play_song(media_player, play_btn, now_playing, g, a, song_idx, album_art_label)
+        update_now_playing(now_playing)
+
+def import_file(win, tree):
+    file_path, _ = QFileDialog.getOpenFileName(win, "Select Music File", "", "Audio Files (*.mp3 *.wav *.ogg)")
+    if not file_path: return
+    artist, title = "Unknown Artist", os.path.basename(file_path)
+    try:
+        from mutagen.mp3 import MP3
+        audio = MP3(file_path)
+        artist = str(audio.tags['TPE1']) if 'TPE1' in audio.tags else artist
+        title = str(audio.tags['TIT2']) if 'TIT2' in audio.tags else title
+    except Exception: pass
+    genre, ok = QInputDialog.getItem(win, "Genre", "Select genre:", GENRES, 0, False)
+    if not ok or not genre.strip(): return
+    album_art_path, _ = QFileDialog.getOpenFileName(win, "Select Album Art (optional)", "", "Image Files (*.png *.jpg *.jpeg *.bmp)")
+    album_art_path = album_art_path or ""
+    music_library.setdefault(genre, {}).setdefault(artist, [])
+    if not any(song["path"] == file_path for song in music_library[genre][artist]):
+        music_library[genre][artist].append({"title": title, "path": file_path, "album_art": album_art_path})
+        update_tree(tree)
+        save_library()
+    else:
+        QMessageBox.information(win, "Duplicate Song", f"'{title}' by '{artist}' is already in the library.")
+
+def set_volume(audio_output, val): audio_output.setVolume(val / 100)
+
+def on_tree_double_clicked(media_player, play_btn, now_playing, item, album_art_label):
+    data = item.data(0, Qt.ItemDataRole.UserRole)
+    if data:
+        genre, artist, path, _ = data
+        idx = next((i for i, s in enumerate(music_library[genre][artist]) if s["path"] == path), -1)
+        if idx != -1:
+            play_song(media_player, play_btn, now_playing, genre, artist, idx, album_art_label)
+        else:
+            QMessageBox.warning(None, "Song Not Found", "Could not find the song in the library structure.")
+
+def search(tree, search_results, query):
+    query = query.strip().lower()
+    if not query:
+        search_results.clear(); search_results.hide(); tree.show(); return
+    search_results.clear(); found_any = False
+    for genre, artists in music_library.items():
+        for artist, songs in artists.items():
+            for song in songs:
+                if (query in song["title"].lower() or query in artist.lower() or query in genre.lower()):
+                    item = QTreeWidgetItem([song["title"], artist, genre])
+                    item.setData(0, Qt.ItemDataRole.UserRole, (genre, artist, song["path"], song.get("album_art", "")))
+                    search_results.addTopLevelItem(item); found_any = True
+    if found_any: tree.hide(); search_results.show()
+    else: search_results.hide(); tree.show()
+
+def on_search_result_double_clicked(media_player, play_btn, now_playing, item, album_art_label):
+    on_tree_double_clicked(media_player, play_btn, now_playing, item, album_art_label)
+
+def save_library():
+    with open(LIBRARY_FILE, "w", encoding="utf-8") as f:
+        json.dump(music_library, f, ensure_ascii=False, indent=2)
+
+def load_library():
+    global music_library
+    if os.path.exists(LIBRARY_FILE):
+        try:
+            with open(LIBRARY_FILE, "r", encoding="utf-8") as f:
+                loaded_data = json.load(f)
+                for genre in GENRES:
+                    if genre not in loaded_data: loaded_data[genre] = {}
+                music_library = loaded_data
+        except json.JSONDecodeError:
+            QMessageBox.warning(None, "Library Error", "Could not load music library. File might be corrupted. Starting with an empty library.")
+            music_library = {g: {} for g in GENRES}
+    else:
+        music_library = {g: {} for g in GENRES}
+
+def main():
+    global is_playing
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    dark_palette = app.palette()
+    for role, color in [
+        (dark_palette.ColorRole.Window, QColor(53, 53, 53)),
+        (dark_palette.ColorRole.WindowText, Qt.GlobalColor.white),
+        (dark_palette.ColorRole.Base, QColor(35, 35, 35)),
+        (dark_palette.ColorRole.AlternateBase, QColor(53, 53, 53)),
+        (dark_palette.ColorRole.ToolTipBase, Qt.GlobalColor.white),
+        (dark_palette.ColorRole.ToolTipText, Qt.GlobalColor.white),
+        (dark_palette.ColorRole.Text, Qt.GlobalColor.white),
+        (dark_palette.ColorRole.Button, QColor(53, 53, 53)),
+        (dark_palette.ColorRole.ButtonText, Qt.GlobalColor.white),
+        (dark_palette.ColorRole.BrightText, Qt.GlobalColor.red),
+        (dark_palette.ColorRole.Highlight, QColor(142, 45, 197).lighter()),
+        (dark_palette.ColorRole.HighlightedText, Qt.GlobalColor.black)
+    ]: dark_palette.setColor(role, color)
+    app.setPalette(dark_palette)
+
+    splash_widget = QWidget()
+    splash_widget.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.SplashScreen)
+    splash_widget.setFixedSize(500, 300)
+    background_image = "supu2.jpeg"
+    if os.path.exists(background_image):
+        splash_widget.setStyleSheet(f"""
+            QWidget {{
+                border: none;
+                background-image: url('{background_image}');
+                background-repeat: no-repeat;
+                background-position: center;
+                background-size: cover;
+            }}
+        """)
+    else:
+        splash_widget.setStyleSheet("background-color: #333;")
+    overlay_layout = QVBoxLayout(splash_widget)
+    overlay_layout.setContentsMargins(30, 30, 30, 30)
+    overlay_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    title = QLabel("Lytes Music Player")
+    title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    title.setStyleSheet("font-size: 28px; font-weight: bold; color: white; background-color: rgba(0,0,0,0.6); padding: 10px; border-radius: 10px;")
+    overlay_layout.addWidget(title)
+    splash_widget.show()
+    app.processEvents()
+
+    def show_main_window_logic():
+        win = QMainWindow()
+        win.setWindowTitle("Lytes Music Player")
+        win.setGeometry(100, 100, 1000, 600)
+        central_widget = QWidget()
+        win.setCentralWidget(central_widget)
+        main_layout = QHBoxLayout(central_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        sidebar = QWidget()
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setSpacing(10)
+        sidebar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        search_bar = QLineEdit()
+        search_bar.setPlaceholderText("Search songs, artists, genres...")
+        search_bar.setClearButtonEnabled(True)
+        search_bar.setStyleSheet("""
+            QLineEdit {
+                background: #353535;
+                border: 2px solid #555555;
+                border-radius: 15px;
+                padding: 5px 15px;
+                font-size: 14px;
+                color: white;
+                selection-background-color: #8e2dc5;
+            }
+            QLineEdit:focus {
+                border: 2px solid #8e2dc5;
+            }
+        """)
+        sidebar_layout.addWidget(search_bar)
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["Song", "Artist", "Genre"])
+        sidebar_layout.addWidget(tree, 1)
+        search_results = QTreeWidget()
+        search_results.setHeaderLabels(["Song", "Artist", "Genre"])
+        search_results.hide()
+        sidebar_layout.addWidget(search_results, 1)
+        import_btn = QPushButton("Import Music")
+        import_btn.setObjectName("import")
+        import_btn.setStyleSheet("""
+            font-size: 18px;
+            min-height: 40px;
+            border-radius: 10px;
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                                        stop:0 #d32f2f, stop:1 #b71c1c);
+            color: white;
+        """)
+        sidebar_layout.addWidget(import_btn)
+        main_layout.addWidget(sidebar, 2)
+
+        player_widget = QWidget()
+        player_layout = QVBoxLayout(player_widget)
+        player_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        player_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        main_layout.addWidget(player_widget, 3)
+        album_art_box = QWidget()
+        album_art_box_layout = QVBoxLayout(album_art_box)
+        album_art_box_layout.setContentsMargins(0, 0, 0, 0)
+        album_art_box_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        album_art_box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        album_art = QLabel()
+        album_art.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        album_art.setFixedSize(220, 220)
+        album_art.setStyleSheet("""
+            QLabel {
+                background: transparent;
+                border: 3px solid #8e2dc5;
+                border-radius: 10px;
+            }
+        """)
+        default_album_path = "default_album.png"
+        if os.path.exists(default_album_path):
+            album_art.setPixmap(QPixmap(default_album_path).scaled(200, 200, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        else:
+            album_art.setPixmap(QIcon.fromTheme("media-optical").pixmap(180, 180))
+        album_art_box_layout.addWidget(album_art)
+        player_layout.addWidget(album_art_box)
+        label_now = QLabel("Now Playing", alignment=Qt.AlignmentFlag.AlignCenter)
+        label_now.setStyleSheet("font-size: 22px; font-weight: bold; margin-top: 10px;")
+        label_now.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        now_playing = QLabel()
+        now_playing.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        now_playing.setWordWrap(True)
+        now_playing.setMinimumHeight(100)
+        now_playing.setStyleSheet("""
+            QLabel {
+                font-size: 18px;
+                font-weight: bold;
+                color: white;
+                padding: 10px;
+                background: rgba(40, 40, 40, 150);
+                border-radius: 10px;
+                border: 1px solid #555555;
+            }
+        """)
+        now_playing.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        label_music = QLabel("Music", alignment=Qt.AlignmentFlag.AlignCenter)
+        label_music.setStyleSheet("font-size: 18px; margin-bottom: 10px;")
+        label_music.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        player_layout.addWidget(label_now)
+        player_layout.addWidget(now_playing)
+        player_layout.addWidget(label_music)
+        media_player = QMediaPlayer()
+        audio_output = QAudioOutput()
+        media_player.setAudioOutput(audio_output)
+        controls_widget = QWidget()
+        controls_layout = QHBoxLayout(controls_widget)
+        controls_layout.setSpacing(40)
+        controls_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        controls_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        btn_style = """
+            QPushButton {
+                font-size: 22px;
+                min-width: 70px;
+                min-height: 70px;
+                border-radius: 35px;
+                background: qradialgradient(cx:0.5, cy:0.5, radius: 0.5,
+                                            fx:0.5, fy:0.5,
+                                            stop:0 rgba(60, 60, 60, 200),
+                                            stop:1 rgba(40, 40, 40, 200));
+                color: white;
+                border: 2px solid #8e2dc5;
+                padding: 10px;
+            }
+            QPushButton:hover {
+                background: qradialgradient(cx:0.5, cy:0.5, radius: 0.5,
+                                            fx:0.5, fy:0.5,
+                                            stop:0 rgba(80, 80, 80, 200),
+                                            stop:1 rgba(60, 60, 60, 200));
+                border: 2px solid #a347d4;
+            }
+            QPushButton:pressed {
+                background: qradialgradient(cx:0.5, cy:0.5, radius: 0.5,
+                                            fx:0.5, fy:0.5,
+                                            stop:0 rgba(40, 40, 40, 200),
+                                            stop:1 rgba(20, 20, 20, 200));
+            }
+            QPushButton#play {
+                min-width: 80px;
+                min-height: 80px;
+                background: qradialgradient(cx:0.5, cy:0.5, radius: 0.5,
+                                            fx:0.5, fy:0.5,
+                                            stop:0 #8e2dc5,
+                                            stop:1 #6d1fa1);
+                border: 2px solid #b45ce6;
+            }
+            QPushButton#play:hover {
+                background: qradialgradient(cx:0.5, cy:0.5, radius: 0.5,
+                                            fx:0.5, fy:0.5,
+                                            stop:0 #9e3dd5,
+                                            stop:1 #7d2fb1);
+            }
+        """
+        play_btn = QPushButton()
+        play_btn.setObjectName("play")
+        play_btn.setIcon(QIcon.fromTheme("media-playback-start"))
+        play_btn.setIconSize(QSize(48, 48))
+        play_btn.setStyleSheet(btn_style)
+        prev_btn = QPushButton()
+        prev_btn.setObjectName("prev")
+        prev_btn.setIcon(QIcon.fromTheme("media-skip-backward"))
+        prev_btn.setIconSize(QSize(40, 40))
+        prev_btn.setStyleSheet(btn_style)
+        next_btn = QPushButton()
+        next_btn.setObjectName("next")
+        next_btn.setIcon(QIcon.fromTheme("media-skip-forward"))
+        next_btn.setIconSize(QSize(40, 40))
+        next_btn.setStyleSheet(btn_style)
+        controls_layout.addWidget(prev_btn)
+        controls_layout.addWidget(play_btn)
+        controls_layout.addWidget(next_btn)
+        player_layout.addWidget(controls_widget)
+        prev_btn.clicked.connect(lambda: prev_song(media_player, play_btn, now_playing, album_art))
+        next_btn.clicked.connect(lambda: next_song(media_player, play_btn, now_playing, album_art))
+        progress_slider = QSlider(Qt.Orientation.Horizontal)
+        progress_slider.setRange(0, 1000)
+        progress_slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        progress_slider.setSingleStep(1)
+        progress_slider.setPageStep(10)
+        progress_slider.setTracking(False)
+        player_layout.addWidget(progress_slider)
+        time_layout = QHBoxLayout()
+        elapsed_label = QLabel("0:00")
+        elapsed_label.setStyleSheet("font-size: 14px; color: #aaa;")
+        total_label = QLabel("0:00")
+        total_label.setStyleSheet("font-size: 14px; color: #aaa;")
+        time_layout.addWidget(elapsed_label)
+        time_layout.addStretch(1)
+        time_layout.addWidget(total_label)
+        player_layout.addLayout(time_layout)
+        vol_slider = QSlider(Qt.Orientation.Horizontal)
+        vol_slider.setRange(0, 100)
+        vol_slider.setValue(50)
+        vol_slider.setSingleStep(1)
+        vol_slider.setPageStep(10)
+        vol_slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        vol_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                border: 1px solid #bbb;
+                background: #353535;
+                height: 8px;
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                background: #8e2dc5;
+                border: 1px solid #5c1e8e;
+                width: 18px;
+                margin: -5px 0;
+                border-radius: 9px;
+            }
+        """)
+        vol_row = QHBoxLayout()
+        vol_label = QLabel("Volume:")
+        vol_label.setStyleSheet("font-size: 14px; color: #aaa;")
+        vol_row.addWidget(vol_label)
+        vol_row.addWidget(vol_slider)
+        player_layout.addLayout(vol_row)
+        vol_slider.valueChanged.connect(lambda val: set_volume(audio_output, val))
+        set_volume(audio_output, vol_slider.value())
+        def format_time(ms):
+            seconds = int(ms / 1000)
+            return f"{seconds//60}:{seconds%60:02d}"
+        def update_progress():
+            dur = media_player.duration()
+            pos = media_player.position()
+            progress_slider.blockSignals(True)
+            progress_slider.setValue(int((pos / dur) * 1000) if dur > 0 else 0)
+            progress_slider.blockSignals(False)
+            elapsed_label.setText(format_time(pos) if dur > 0 else "0:00")
+            total_label.setText(format_time(dur) if dur > 0 else "0:00")
+        def seek_position(value):
+            dur = media_player.duration()
+            if dur > 0:
+                media_player.setPosition(int((value / 1000) * dur))
+        progress_slider.sliderMoved.connect(seek_position)
+        media_player.positionChanged.connect(update_progress)
+        media_player.durationChanged.connect(update_progress)
+        timer = QTimer()
+        timer.timeout.connect(update_progress)
+        timer.start(100)
+        def on_media_status_changed(status):
+            if status == QMediaPlayer.MediaStatus.NoMedia:
+                elapsed_label.setText("0:00")
+                total_label.setText("0:00")
+                progress_slider.setValue(0)
+                play_btn.setIcon(QIcon.fromTheme("media-playback-start"))
+                update_now_playing(now_playing)
+                album_art.setPixmap(QPixmap(default_album_path).scaled(200, 200, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                                    if os.path.exists(default_album_path)
+                                    else QIcon.fromTheme("media-optical").pixmap(180, 180))
+            elif status == QMediaPlayer.MediaStatus.EndOfMedia:
+                next_song(media_player, play_btn, now_playing, album_art)
+        media_player.mediaStatusChanged.connect(on_media_status_changed)
+        import_btn.clicked.connect(lambda: import_file(win, tree))
+        tree.itemDoubleClicked.connect(lambda item, _: on_tree_double_clicked(media_player, play_btn, now_playing, item, album_art))
+        search_bar.textChanged.connect(lambda text: search(tree, search_results, text))
+        search_results.itemDoubleClicked.connect(lambda item, _: on_search_result_double_clicked(media_player, play_btn, now_playing, item, album_art))
+        load_library()
+        update_tree(tree)
+        win.show()
+        app.aboutToQuit.connect(save_library)
+        for k, a in [
+            (Qt.Key.Key_Space, lambda: toggle_play(media_player, play_btn, now_playing, album_art)),
+            (Qt.Key.Key_Left, lambda: prev_song(media_player, play_btn, now_playing, album_art)),
+            (Qt.Key.Key_Right, lambda: next_song(media_player, play_btn, now_playing, album_art)),
+            (Qt.Key.Key_Up, lambda: vol_slider.setValue(min(vol_slider.value() + 5, 100))),
+            (Qt.Key.Key_Down, lambda: vol_slider.setValue(max(vol_slider.value() - 5, 0))),
+        ]:
+            QShortcut(QKeySequence(k), win).activated.connect(a)
+    def after_splash():
+        splash_widget.close()
+        show_main_window_logic()
+    QTimer.singleShot(3000, after_splash)
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
